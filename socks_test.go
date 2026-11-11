@@ -4,11 +4,15 @@ import (
 	"bytes"
 	"crypto/rand"
 	"fmt"
+	"io"
 	"net"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"testing"
 	"time"
+
+	"github.com/go-gost/gosocks5"
 )
 
 var socks5ProxyTests = []struct {
@@ -786,5 +790,124 @@ func BenchmarkSOCKS5UDPTunSingleConn(b *testing.B) {
 		if err := roundtrip(conn, sendData); err != nil {
 			b.Error(err)
 		}
+	}
+}
+
+// socks5PipelinedHandshake performs a SOCKS5 handshake in which the method
+// selection, the username/password request and the CONNECT request are sent
+// back-to-back without waiting for the server's replies. This is what clients
+// built on v2ray-core/Xray do (e.g. Netch), and it used to fail with gosocks5
+// v0.3.0, whose ReadMethods could consume the pipelined auth request.
+func socks5PipelinedHandshake(conn net.Conn, user *url.Userinfo, target string) error {
+	host, sport, err := net.SplitHostPort(target)
+	if err != nil {
+		return err
+	}
+	port, err := strconv.Atoi(sport)
+	if err != nil {
+		return err
+	}
+
+	// method selection, optionally followed by the auth request
+	method := gosocks5.MethodNoAuth
+	req := []byte{gosocks5.Ver5, 1, method}
+	if user != nil {
+		method = gosocks5.MethodUserPass
+		req[2] = method
+
+		password, _ := user.Password()
+		username := user.Username()
+		req = append(req, gosocks5.UserPassVer, byte(len(username)))
+		req = append(req, username...)
+		req = append(req, byte(len(password)))
+		req = append(req, password...)
+	}
+
+	// CONNECT request, appended in the same write
+	addr := &gosocks5.Addr{
+		Type: gosocks5.AddrDomain,
+		Host: host,
+		Port: uint16(port),
+	}
+	req = append(req, gosocks5.Ver5, gosocks5.CmdConnect, 0, addr.Type, byte(len(addr.Host)))
+	req = append(req, addr.Host...)
+	req = append(req, byte(addr.Port>>8), byte(addr.Port))
+
+	if _, err := conn.Write(req); err != nil {
+		return err
+	}
+
+	var b [2]byte
+	if _, err := io.ReadFull(conn, b[:]); err != nil {
+		return fmt.Errorf("read method: %w", err)
+	}
+	if b[0] != gosocks5.Ver5 || b[1] != method {
+		return fmt.Errorf("unexpected method reply: %v", b)
+	}
+
+	if method == gosocks5.MethodUserPass {
+		if _, err := io.ReadFull(conn, b[:]); err != nil {
+			return fmt.Errorf("read auth reply: %w", err)
+		}
+		if b[1] != gosocks5.Succeeded {
+			return fmt.Errorf("auth failed: %d", b[1])
+		}
+	}
+
+	reply, err := gosocks5.ReadReply(conn)
+	if err != nil {
+		return fmt.Errorf("read reply: %w", err)
+	}
+	if reply.Rep != gosocks5.Succeeded {
+		return fmt.Errorf("connect failed: %d", reply.Rep)
+	}
+	return nil
+}
+
+func TestSOCKS5PipelinedHandshake(t *testing.T) {
+	httpSrv := httptest.NewServer(httpTestHandler)
+	defer httpSrv.Close()
+
+	users := []*url.Userinfo{url.UserPassword("admin", "123456")}
+
+	handlers := []struct {
+		name    string
+		handler func() Handler
+	}{
+		{"socks5", func() Handler { return SOCKS5Handler(UsersHandlerOption(users...)) }},
+		{"auto", func() Handler { return AutoHandler(UsersHandlerOption(users...)) }},
+	}
+
+	for _, hc := range handlers {
+		hc := hc
+		t.Run(hc.name, func(t *testing.T) {
+			ln, err := TCPListener("")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			server := &Server{
+				Handler:  hc.handler(),
+				Listener: ln,
+			}
+			go server.Run()
+			defer server.Close()
+
+			conn, err := net.Dial("tcp", ln.Addr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			conn.SetDeadline(time.Now().Add(3 * time.Second))
+
+			if err := socks5PipelinedHandshake(conn, users[0], httpSrv.Listener.Addr().String()); err != nil {
+				t.Fatalf("handshake: %v", err)
+			}
+
+			sendData := []byte("Hello World!")
+			if err := httpRoundtrip(conn, httpSrv.URL, sendData); err != nil {
+				t.Fatalf("roundtrip: %v", err)
+			}
+		})
 	}
 }

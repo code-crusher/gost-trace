@@ -394,7 +394,7 @@ func (h *shadowUDPHandler) transportPacket(conn, cc net.PacketConn) (err error) 
 
 				dgram := gosocks5.NewUDPDatagram(gosocks5.NewUDPHeader(0, 0, toSocksAddr(addr)), b[:n])
 				buf := bytes.Buffer{}
-				if err = dgram.Write(&buf); err != nil {
+				if _, err = dgram.WriteTo(&buf); err != nil {
 					return err
 				}
 				_, err = conn.WriteTo(buf.Bytes()[3:], clientAddr)
@@ -421,8 +421,8 @@ func (h *shadowUDPHandler) transportUDP(conn net.Conn, cc net.PacketConn) error 
 	go func() {
 		for {
 			er := func() (err error) {
-				dgram, err := gosocks5.ReadUDPDatagram(conn)
-				if err != nil {
+				dgram := &gosocks5.UDPDatagram{}
+				if _, err = dgram.ReadFrom(conn); err != nil {
 					// log.Logf("[ssu] %s - %s : %s", conn.RemoteAddr(), conn.LocalAddr(), err)
 					return
 				}
@@ -469,7 +469,7 @@ func (h *shadowUDPHandler) transportUDP(conn net.Conn, cc net.PacketConn) error 
 				dgram := gosocks5.NewUDPDatagram(
 					gosocks5.NewUDPHeader(uint16(n), 0, toSocksAddr(addr)), b[:n])
 				buf := bytes.Buffer{}
-				dgram.Write(&buf)
+				dgram.WriteTo(&buf)
 				_, err = conn.Write(buf.Bytes())
 				return
 			}()
@@ -526,8 +526,8 @@ func (c *shadowUDPPacketConn) ReadFrom(b []byte) (n int, addr net.Addr, err erro
 		return
 	}
 
-	dgram, err := gosocks5.ReadUDPDatagram(bytes.NewReader(buf[:n+3]))
-	if err != nil {
+	dgram := &gosocks5.UDPDatagram{}
+	if _, err = dgram.ReadFrom(bytes.NewReader(buf[:n+3])); err != nil {
 		return
 	}
 	n = copy(b, dgram.Data)
