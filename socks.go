@@ -245,16 +245,11 @@ func (c *socks5Connector) ConnectContext(ctx context.Context, conn net.Conn, net
 	}
 	conn = cc
 
-	host, port, err := net.SplitHostPort(address)
+	addr, err := gosocks5.NewAddr(address)
 	if err != nil {
 		return nil, err
 	}
-	p, _ := strconv.Atoi(port)
-	req := gosocks5.NewRequest(gosocks5.CmdConnect, &gosocks5.Addr{
-		Type: gosocks5.AddrDomain,
-		Host: host,
-		Port: uint16(p),
-	})
+	req := gosocks5.NewRequest(gosocks5.CmdConnect, addr)
 	if err := req.Write(conn); err != nil {
 		return nil, err
 	}

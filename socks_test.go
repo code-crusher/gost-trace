@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"crypto/rand"
 	"fmt"
+	"io"
 	"net"
 	"net/http/httptest"
 	"net/url"
 	"testing"
 	"time"
+
+	"github.com/go-gost/gosocks5"
 )
 
 var socks5ProxyTests = []struct {
@@ -786,5 +789,93 @@ func BenchmarkSOCKS5UDPTunSingleConn(b *testing.B) {
 		if err := roundtrip(conn, sendData); err != nil {
 			b.Error(err)
 		}
+	}
+}
+
+// TestSOCKS5ConnectorAddrType checks that the SOCKS5 connector sends the
+// correct address type (ATYP) to the proxy server. IP literals must be sent
+// as IPv4/IPv6 addresses rather than as domain names, otherwise the proxy
+// server has to resolve an IP literal as a domain and may reject it.
+func TestSOCKS5ConnectorAddrType(t *testing.T) {
+	tests := []struct {
+		addr  string
+		atype uint8
+	}{
+		{"127.0.0.1:80", gosocks5.AddrIPv4},
+		{"[::1]:80", gosocks5.AddrIPv6},
+		{"[2ae2:9ac7:88da:1489:a9:abaa:86a5:38c2]:44509", gosocks5.AddrIPv6},
+		{"example.com:80", gosocks5.AddrDomain},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.addr, func(t *testing.T) {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer ln.Close()
+
+			addrCh := make(chan *gosocks5.Addr, 1)
+			errCh := make(chan error, 1)
+			go func() {
+				conn, err := ln.Accept()
+				if err != nil {
+					errCh <- err
+					return
+				}
+				defer conn.Close()
+
+				if _, err := gosocks5.ReadMethods(conn); err != nil {
+					errCh <- err
+					return
+				}
+				if _, err := conn.Write([]byte{gosocks5.Ver5, gosocks5.MethodNoAuth}); err != nil {
+					errCh <- err
+					return
+				}
+
+				req, err := gosocks5.ReadRequest(conn)
+				if err != nil {
+					errCh <- err
+					return
+				}
+				addrCh <- req.Addr
+
+				rep := gosocks5.NewReply(gosocks5.Succeeded, &gosocks5.Addr{
+					Type: gosocks5.AddrIPv4,
+					Host: "127.0.0.1",
+				})
+				if err := rep.Write(conn); err != nil {
+					errCh <- err
+					return
+				}
+				// keep the connection open until the client is done.
+				io.Copy(io.Discard, conn)
+			}()
+
+			conn, err := net.Dial("tcp", ln.Addr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+
+			cc, err := SOCKS5Connector(nil).Connect(conn, tc.addr)
+			if err != nil {
+				t.Fatalf("connect to %s: %v", tc.addr, err)
+			}
+			defer cc.Close()
+
+			select {
+			case err := <-errCh:
+				t.Fatal(err)
+			case addr := <-addrCh:
+				if addr.Type != tc.atype {
+					t.Errorf("addr type = %d, want %d", addr.Type, tc.atype)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("timeout waiting for request")
+			}
+		})
 	}
 }
